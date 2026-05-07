@@ -95,27 +95,52 @@ def save_cached_candles(symbol: str, interval: str, payload: List) -> None:
     cache_path(symbol, interval).write_text(json.dumps(payload))
 
 
+def normalize_candle_payload(payload) -> Optional[List[Dict]]:
+    """Handle CoinDCX payload variants and normalize to list[dict]."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "candles", "result"):
+            if isinstance(payload.get(key), list):
+                return payload[key]
+    return None
+
+
 def fetch_candles(symbol: str, interval: str, limit: int) -> Optional[List[Dict]]:
     cached = load_cached_candles(symbol, interval)
     if cached is not None:
         return cached
 
-    params = {"pair": symbol, "interval": interval, "limit": limit}
-    response = request_with_retry(CANDLES_URL, params=params)
-    if response is None:
-        return None
-    payload = response.json()
-    if not isinstance(payload, list):
-        return None
-    save_cached_candles(symbol, interval, payload)
-    return payload
+    # CoinDCX has returned multiple request/response formats across endpoints.
+    candidates = [
+        {"pair": symbol, "interval": interval, "limit": limit},
+        {"symbol": symbol, "interval": interval, "limit": limit},
+    ]
+    for params in candidates:
+        response = request_with_retry(CANDLES_URL, params=params)
+        if response is None:
+            continue
+        payload = normalize_candle_payload(response.json())
+        if payload:
+            save_cached_candles(symbol, interval, payload)
+            return payload
+    return None
 
 
 def to_df(candles: List[Dict]) -> pd.DataFrame:
     df = pd.DataFrame(candles)
-    cols = ["open", "high", "low", "close", "volume"]
-    for c in cols:
-        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    # Support both verbose keys and compact OHLCV keys.
+    aliases = {
+        "open": ["open", "o"],
+        "high": ["high", "h"],
+        "low": ["low", "l"],
+        "close": ["close", "c"],
+        "volume": ["volume", "v"],
+        "time": ["time", "t"],
+    }
+    for target, keys in aliases.items():
+        source = next((k for k in keys if k in df.columns), None)
+        df[target] = pd.to_numeric(df[source], errors="coerce") if source else pd.NA
     if "time" in df.columns:
         df["time"] = pd.to_numeric(df["time"], errors="coerce")
         df = df.sort_values("time")
@@ -207,7 +232,7 @@ def build_symbol_snapshot(market: Dict, snapshot_time: str) -> Tuple[Optional[Di
 
     df1 = to_df(candles_1d)
     df4 = to_df(candles_4h)
-    if len(df1) < 31 or len(df4) < 43:
+    if len(df1) < 2 or len(df4) < 2:
         return None, symbol
 
     c = df1["close"]
@@ -220,11 +245,13 @@ def build_symbol_snapshot(market: Dict, snapshot_time: str) -> Tuple[Optional[Di
     latest_volume = safe_float(v.iloc[-1])
     relative_volume = safe_float((avg_volume_7d / avg_volume_30d) if avg_volume_30d else None)
 
-    change_7d = pct_change(c.iloc[-1], c.iloc[-8])
-    change_30d = pct_change(c.iloc[-1], c.iloc[-31])
+    idx_7d = -8 if len(c) >= 8 else 0
+    idx_30d = -31 if len(c) >= 31 else 0
+    change_7d = pct_change(c.iloc[-1], c.iloc[idx_7d]) if idx_7d != 0 else None
+    change_30d = pct_change(c.iloc[-1], c.iloc[idx_30d]) if idx_30d != 0 else None
     breakout_1d = bool(current_price and high_30d and current_price >= high_30d * 0.995)
     near_30d_high = bool(current_price and high_30d and current_price >= high_30d * 0.98)
-    new_30d_high = bool(len(df1) >= 31 and df1["high"].iloc[-1] >= df1["high"].tail(30).max())
+    new_30d_high = bool(df1["high"].iloc[-1] >= df1["high"].tail(min(30, len(df1))).max())
 
     returns_1d = c.pct_change().dropna()
     vol_7d = safe_float(returns_1d.tail(7).std() * 100)
@@ -277,10 +304,10 @@ def build_symbol_snapshot(market: Dict, snapshot_time: str) -> Tuple[Optional[Di
         "pair": str(market.get("pair") or symbol),
         "current_price": current_price,
         "snapshot_time_utc": snapshot_time,
-        "change_1d_percent": safe_float(pct_change(c.iloc[-1], c.iloc[-2])),
-        "change_3d_percent": safe_float(pct_change(c.iloc[-1], c.iloc[-4])),
+        "change_1d_percent": safe_float(pct_change(c.iloc[-1], c.iloc[-2])) if len(c) >= 2 else None,
+        "change_3d_percent": safe_float(pct_change(c.iloc[-1], c.iloc[-4])) if len(c) >= 4 else None,
         "change_7d_percent": safe_float(change_7d),
-        "change_14d_percent": safe_float(pct_change(c.iloc[-1], c.iloc[-15])),
+        "change_14d_percent": safe_float(pct_change(c.iloc[-1], c.iloc[-15])) if len(c) >= 15 else None,
         "change_30d_percent": safe_float(change_30d),
         "high_30d": high_30d,
         "low_30d": low_30d,
@@ -294,9 +321,9 @@ def build_symbol_snapshot(market: Dict, snapshot_time: str) -> Tuple[Optional[Di
         "relative_volume_7d_vs_30d": relative_volume,
         "volatility_7d_percent": vol_7d,
         "volatility_30d_percent": vol_30d,
-        "change_4h_percent": safe_float(pct_change(c4.iloc[-1], c4.iloc[-2])),
-        "change_12h_percent": safe_float(pct_change(c4.iloc[-1], c4.iloc[-4])),
-        "change_24h_percent": safe_float(pct_change(c4.iloc[-1], c4.iloc[-7])),
+        "change_4h_percent": safe_float(pct_change(c4.iloc[-1], c4.iloc[-2])) if len(c4) >= 2 else None,
+        "change_12h_percent": safe_float(pct_change(c4.iloc[-1], c4.iloc[-4])) if len(c4) >= 4 else None,
+        "change_24h_percent": safe_float(pct_change(c4.iloc[-1], c4.iloc[-7])) if len(c4) >= 7 else None,
         "high_7d_4h": high_7d_4h,
         "low_7d_4h": safe_float(df4["low"].tail(42).min()),
         "distance_from_7d_high_4h_percent": safe_float(pct_change(c4.iloc[-1], high_7d_4h)),
