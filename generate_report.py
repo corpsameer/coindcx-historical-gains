@@ -71,20 +71,44 @@ def fetch_markets(session: requests.Session) -> List[dict]:
 
 
 def split_markets(markets: List[dict]) -> Tuple[List[dict], List[dict]]:
-    """Filter active markets, then separate Spot and USDT futures."""
+    """Filter active markets, then separate Spot and USDT futures.
+
+    CoinDCX response fields vary by environment/version, so we support multiple
+    active and type indicators (active/status, market/market_type, etc.).
+    """
     spot, futures = [], []
     for m in markets:
-        if not isinstance(m, dict) or not m.get("active", False):
+        if not isinstance(m, dict):
             continue
-        pair, symbol = m.get("pair"), m.get("symbol")
+
+        is_active = bool(m.get("active", False)) or str(m.get("status", "")).lower() in {"active", "enabled"}
+        if not is_active:
+            continue
+
+        pair = m.get("pair") or m.get("coindcx_name") or m.get("symbol")
+        symbol = m.get("symbol") or m.get("coindcx_name") or pair
         if not pair or not symbol:
             continue
-        mtype = str(m.get("market_type", "")).lower()
-        quote = str(m.get("target_currency_short_name", "")).upper()
-        if "futures" in mtype and quote == "USDT":
-            futures.append(m)
-        elif "futures" not in mtype:
-            spot.append(m)
+
+        mtype = " ".join(
+            str(m.get(k, "")).lower()
+            for k in ["market_type", "market", "instrument_type", "segment", "contract_type"]
+        )
+        quote = str(
+            m.get("target_currency_short_name")
+            or m.get("quote_currency_short_name")
+            or m.get("quote_currency")
+            or ""
+        ).upper()
+
+        is_futures = any(x in mtype for x in ["future", "perpetual", "futures"])
+
+        if is_futures:
+            # If quote is missing, still include likely USDT perpetual pairs by naming.
+            if quote == "USDT" or "USDT" in str(symbol).upper() or "USDT" in str(pair).upper():
+                futures.append({**m, "pair": pair, "symbol": symbol})
+        else:
+            spot.append({**m, "pair": pair, "symbol": symbol})
     return spot, futures
 
 
@@ -228,7 +252,11 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     session = make_session()
-    spot, futures = split_markets(fetch_markets(session))
+    all_markets = fetch_markets(session)
+    spot, futures = split_markets(all_markets)
+    if len(spot) == 0 and len(futures) == 0:
+        sample_keys = sorted(list(all_markets[0].keys())) if all_markets else []
+        print("WARNING: 0 markets classified. Sample keys from markets_details:", sample_keys)
 
     start_ts = pd.Timestamp(START_DATE, tz="UTC")
     end_ts = pd.Timestamp(END_DATE, tz="UTC")
