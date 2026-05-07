@@ -146,7 +146,7 @@ def symbol_best_by_window(symbol: str, pair: str, df: pd.DataFrame, ws: pd.Times
     start_price = float(indexed.loc[ws_d, "open"] if not isinstance(indexed.loc[ws_d, "open"], pd.Series) else indexed.loc[ws_d, "open"].iloc[0])
     if start_price <= 0:
         return None
-    we = (ws + pd.Timedelta(days=WINDOW_DAYS - 1)).date()
+    we = (ws + pd.Timedelta(days=WINDOW_DAYS)).date()
     wdf = df[(df["date"] >= ws_d) & (df["date"] <= we)]
     if wdf.empty:
         return None
@@ -155,7 +155,7 @@ def symbol_best_by_window(symbol: str, pair: str, df: pd.DataFrame, ws: pd.Times
     return {"window_start_date": ws_d, "window_end_date": we, "symbol": symbol, "pair": pair, "start_price": start_price, "max_price": max_price, "max_date": mr["date"], "gain_percent": ((max_price - start_price) / start_price) * 100.0, "x_gain": max_price / start_price}
 
 
-def process_group(session, markets, market_type, start_ms, end_ms, chain_starts):
+def process_group(session, markets, market_type, start_ms, end_ms, start_date: str, end_date: str):
     symbol_data, failed, processed = [], [], 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futs = [ex.submit(fetch_symbol_df, session, m, market_type, start_ms, end_ms) for m in markets]
@@ -167,49 +167,29 @@ def process_group(session, markets, market_type, start_ms, end_ms, chain_starts)
                 continue
             symbol_data.append((symbol, pair, df))
 
-    # Chained windows: next start date is previous winner max_date + 1 day.
+    # True chained windows: next window starts at previous winner max_date + 1 day.
     rows = []
-    for ws in chain_starts:
+    current = pd.Timestamp(start_date)
+    hard_end = pd.Timestamp(end_date)
+    while current <= hard_end:
         best = None
         for symbol, pair, df in symbol_data:
-            row = symbol_best_by_window(symbol, pair, df, ws)
+            row = symbol_best_by_window(symbol, pair, df, current)
             if row is None:
                 continue
             if best is None or row["gain_percent"] > best["gain_percent"]:
                 best = row
+
         if best is None:
+            # no eligible symbol for this day; move to next day
+            current += pd.Timedelta(days=1)
             continue
+
         best["market_type"] = market_type
         rows.append(best)
+        current = pd.Timestamp(best["max_date"]) + pd.Timedelta(days=1)
+
     return rows, failed, processed
-
-
-def build_chained_starts(start_date: str, end_date: str) -> List[pd.Timestamp]:
-    starts = []
-    current = pd.Timestamp(start_date, tz="UTC")
-    hard_end = pd.Timestamp(end_date, tz="UTC")
-    while current <= hard_end:
-        starts.append(current)
-        # Placeholder; actual next start determined after winner max_date in reduce step.
-        current += pd.Timedelta(days=WINDOW_DAYS)
-    return starts
-
-
-def reduce_to_non_overlapping(winner_rows: List[dict], end_date: str) -> List[dict]:
-    if not winner_rows:
-        return []
-    by_start = {pd.Timestamp(r["window_start_date"]): r for r in winner_rows}
-    out = []
-    cur = min(by_start.keys())
-    hard_end = pd.Timestamp(end_date)
-    while cur <= hard_end:
-        r = by_start.get(cur)
-        if r is None:
-            cur += pd.Timedelta(days=1)
-            continue
-        out.append(r)
-        cur = pd.Timestamp(r["max_date"]) + pd.Timedelta(days=1)
-    return out
 
 
 def export_winners(df, csv_path, xlsx_path):
@@ -232,15 +212,11 @@ def main():
 
     start_ts = pd.Timestamp(START_DATE, tz="UTC")
     end_ts = pd.Timestamp(END_DATE, tz="UTC")
-    chain_starts = build_chained_starts(START_DATE, END_DATE)
     start_ms = int(start_ts.timestamp() * 1000)
     end_ms = int((end_ts + pd.Timedelta(days=1)).timestamp() * 1000) - 1
 
-    spot_rows, spot_failed, spot_processed = process_group(session, spot, "spot", start_ms, end_ms, chain_starts)
-    fut_rows, fut_failed, fut_processed = process_group(session, futures, "futures", start_ms, end_ms, chain_starts)
-
-    spot_rows = reduce_to_non_overlapping(spot_rows, END_DATE)
-    fut_rows = reduce_to_non_overlapping(fut_rows, END_DATE)
+    spot_rows, spot_failed, spot_processed = process_group(session, spot, "spot", start_ms, end_ms, START_DATE, END_DATE)
+    fut_rows, fut_failed, fut_processed = process_group(session, futures, "futures", start_ms, end_ms, START_DATE, END_DATE)
 
     cols = ["market_type", "window_start_date", "window_end_date", "symbol", "pair", "start_price", "max_price", "max_date", "gain_percent", "x_gain"]
     spot_df = pd.DataFrame(spot_rows, columns=cols)

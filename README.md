@@ -28,7 +28,7 @@ Auto-creates `cache/` and `output/` and writes:
 
 Rows are sorted by `window_start_date` ascending.
 
-Winner selection uses chained windows: start at `2025-04-01`; after each selected winner, the next window starts on `max_date + 1 day`. This produces a compact sequence (for your date range, typically around ~13 windows per market).
+Winner selection uses true chained windows: start at `2025-04-01`; for each step, `window_end_date = window_start_date + 30 days`, pick the highest gainer whose `max_date` falls within that window, then set next `window_start_date = previous max_date + 1 day`.
 
 ## Known limitation
 
