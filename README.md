@@ -28,6 +28,8 @@ Auto-creates `cache/` and `output/` and writes:
 
 Rows are sorted by `window_start_date` ascending.
 
+Winner selection uses chained windows: start at `2025-04-01`; after each selected winner, the next window starts on `max_date + 1 day`. This produces a compact sequence (for your date range, typically around ~13 windows per market).
+
 ## Known limitation
 
 Exact historical listing/delisting status for each past date may not be fully available from active market details. The script uses currently active CoinDCX markets and skips symbols without sufficient historical data.

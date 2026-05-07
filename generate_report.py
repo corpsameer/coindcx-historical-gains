@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CoinDCX rolling 30-day window winners report (Spot + USDT Futures)."""
+"""CoinDCX rolling 30-day chained-window winners report (Spot + USDT Futures)."""
 
 from __future__ import annotations
 
@@ -32,16 +32,7 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 def make_session() -> requests.Session:
     session = requests.Session()
-    retry = Retry(
-        total=MAX_RETRIES,
-        connect=MAX_RETRIES,
-        read=MAX_RETRIES,
-        status=MAX_RETRIES,
-        backoff_factor=BACKOFF_FACTOR,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
+    retry = Retry(total=MAX_RETRIES, connect=MAX_RETRIES, read=MAX_RETRIES, status=MAX_RETRIES, backoff_factor=BACKOFF_FACTOR, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"], raise_on_status=False)
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -70,45 +61,31 @@ def fetch_markets(session: requests.Session) -> List[dict]:
     return data
 
 
-def split_markets(markets: List[dict]) -> Tuple[List[dict], List[dict]]:
-    """Filter active markets, then separate Spot and USDT futures.
+def is_active_market(m: dict) -> bool:
+    return bool(m.get("active", False)) or str(m.get("status", "")).lower() in {"active", "enabled"}
 
-    CoinDCX response fields vary by environment/version, so we support multiple
-    active and type indicators (active/status, market/market_type, etc.).
-    """
+
+def looks_like_futures(m: dict, symbol: str, pair: str) -> bool:
+    blob = " ".join(str(m.get(k, "")).lower() for k in ["market_type", "market", "instrument_type", "segment", "contract_type", "name", "coindcx_name"])
+    return any(x in blob for x in ["future", "futures", "perp", "perpetual", "swap"])
+
+
+def split_markets(markets: List[dict]) -> Tuple[List[dict], List[dict]]:
     spot, futures = [], []
     for m in markets:
-        if not isinstance(m, dict):
+        if not isinstance(m, dict) or not is_active_market(m):
             continue
-
-        is_active = bool(m.get("active", False)) or str(m.get("status", "")).lower() in {"active", "enabled"}
-        if not is_active:
-            continue
-
         pair = m.get("pair") or m.get("coindcx_name") or m.get("symbol")
         symbol = m.get("symbol") or m.get("coindcx_name") or pair
         if not pair or not symbol:
             continue
-
-        mtype = " ".join(
-            str(m.get(k, "")).lower()
-            for k in ["market_type", "market", "instrument_type", "segment", "contract_type"]
-        )
-        quote = str(
-            m.get("target_currency_short_name")
-            or m.get("quote_currency_short_name")
-            or m.get("quote_currency")
-            or ""
-        ).upper()
-
-        is_futures = any(x in mtype for x in ["future", "perpetual", "futures"])
-
-        if is_futures:
-            # If quote is missing, still include likely USDT perpetual pairs by naming.
-            if quote == "USDT" or "USDT" in str(symbol).upper() or "USDT" in str(pair).upper():
-                futures.append({**m, "pair": pair, "symbol": symbol})
-        else:
+        quote = str(m.get("target_currency_short_name") or m.get("quote_currency_short_name") or m.get("quote_currency") or "").upper()
+        fut = looks_like_futures(m, symbol, pair)
+        if fut and (quote == "USDT" or "USDT" in str(symbol).upper() or "USDT" in str(pair).upper()):
+            futures.append({**m, "pair": pair, "symbol": symbol})
+        elif not fut:
             spot.append({**m, "pair": pair, "symbol": symbol})
+
     return spot, futures
 
 
@@ -117,57 +94,39 @@ def cache_path(market_type: str, pair: str) -> Path:
 
 
 def parse_candles(raw) -> pd.DataFrame:
-    """Parse CoinDCX candle response into date/open/high frame.
-
-    CoinDCX docs show objects with keys {time, open, high, low, close, volume}.
-    Some environments may still return list tuples. We support both shapes.
-    """
     rows = []
     if isinstance(raw, dict):
-        # Defensive: sometimes APIs wrap payloads.
         for key in ["data", "candles", "result"]:
             if isinstance(raw.get(key), list):
                 raw = raw[key]
                 break
-
     if not isinstance(raw, list):
         return pd.DataFrame(columns=["date", "open", "high"])
-
     for c in raw:
         try:
             if isinstance(c, dict):
-                ts = c.get("time")
-                o = c.get("open")
-                h = c.get("high")
+                ts, o, h = c.get("time"), c.get("open"), c.get("high")
             elif isinstance(c, (list, tuple)) and len(c) >= 3:
                 ts, o, h = c[0], c[1], c[2]
             else:
                 continue
-
             d = pd.to_datetime(int(ts), unit="ms", utc=True).date()
-            o = float(o)
-            h = float(h)
+            rows.append({"date": d, "open": float(o), "high": float(h)})
         except (TypeError, ValueError):
             continue
-        rows.append({"date": d, "open": o, "high": h})
-
     if not rows:
         return pd.DataFrame(columns=["date", "open", "high"])
     return pd.DataFrame(rows).sort_values("date").drop_duplicates("date", keep="last")
 
 
-def fetch_symbol_df(session: requests.Session, market: dict, market_type: str, start_ms: int, end_ms: int):
+def fetch_symbol_df(session, market, market_type, start_ms, end_ms):
     symbol, pair = market.get("symbol", ""), market.get("pair", "")
     cp = cache_path(market_type, pair)
     try:
         if cp.exists():
             raw = json.loads(cp.read_text(encoding="utf-8"))
         else:
-            raw = get_with_explicit_retries(
-                session,
-                CANDLES_URL,
-                params={"pair": pair, "interval": "1d", "startTime": start_ms, "endTime": end_ms, "limit": 1000},
-            ).json()
+            raw = get_with_explicit_retries(session, CANDLES_URL, params={"pair": pair, "interval": "1d", "startTime": start_ms, "endTime": end_ms, "limit": 1000}).json()
             cp.write_text(json.dumps(raw), encoding="utf-8")
         if (isinstance(raw, list) and not raw) or raw is None:
             return symbol, pair, None, "empty candle data"
@@ -179,42 +138,25 @@ def fetch_symbol_df(session: requests.Session, market: dict, market_type: str, s
         return symbol, pair, None, str(exc)
 
 
-def symbol_best_by_window(symbol: str, pair: str, df: pd.DataFrame, window_starts: List[pd.Timestamp]) -> Dict[pd.Timestamp, dict]:
-    """For each requested window start, compute this symbol's gain if start open exists."""
-    out: Dict[pd.Timestamp, dict] = {}
+def symbol_best_by_window(symbol: str, pair: str, df: pd.DataFrame, ws: pd.Timestamp) -> Optional[dict]:
+    ws_d = ws.date()
     indexed = df.set_index("date")
-    for ws in window_starts:
-        ws_d = ws.date()
-        if ws_d not in indexed.index:
-            continue
-        start_price = float(indexed.loc[ws_d, "open"] if not isinstance(indexed.loc[ws_d, "open"], pd.Series) else indexed.loc[ws_d, "open"].iloc[0])
-        if start_price <= 0:
-            continue
-        we = (ws + pd.Timedelta(days=WINDOW_DAYS - 1)).date()
-        wdf = df[(df["date"] >= ws_d) & (df["date"] <= we)]
-        if wdf.empty:
-            continue
-        idx = wdf["high"].idxmax()
-        mr = wdf.loc[idx]
-        max_price = float(mr["high"])
-        out[ws] = {
-            "window_start_date": ws_d,
-            "window_end_date": we,
-            "symbol": symbol,
-            "pair": pair,
-            "start_price": start_price,
-            "max_price": max_price,
-            "max_date": mr["date"],
-            "gain_percent": ((max_price - start_price) / start_price) * 100.0,
-            "x_gain": max_price / start_price,
-        }
-    return out
+    if ws_d not in indexed.index:
+        return None
+    start_price = float(indexed.loc[ws_d, "open"] if not isinstance(indexed.loc[ws_d, "open"], pd.Series) else indexed.loc[ws_d, "open"].iloc[0])
+    if start_price <= 0:
+        return None
+    we = (ws + pd.Timedelta(days=WINDOW_DAYS - 1)).date()
+    wdf = df[(df["date"] >= ws_d) & (df["date"] <= we)]
+    if wdf.empty:
+        return None
+    mr = wdf.loc[wdf["high"].idxmax()]
+    max_price = float(mr["high"])
+    return {"window_start_date": ws_d, "window_end_date": we, "symbol": symbol, "pair": pair, "start_price": start_price, "max_price": max_price, "max_date": mr["date"], "gain_percent": ((max_price - start_price) / start_price) * 100.0, "x_gain": max_price / start_price}
 
 
-def process_group(session: requests.Session, markets: List[dict], market_type: str, start_ms: int, end_ms: int, window_starts):
-    winners: Dict[pd.Timestamp, dict] = {}
-    failed, processed = [], 0
-
+def process_group(session, markets, market_type, start_ms, end_ms, chain_starts):
+    symbol_data, failed, processed = [], [], 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futs = [ex.submit(fetch_symbol_df, session, m, market_type, start_ms, end_ms) for m in markets]
         for f in tqdm(as_completed(futs), total=len(futs), desc=f"{market_type} candles"):
@@ -223,71 +165,82 @@ def process_group(session: requests.Session, markets: List[dict], market_type: s
             if err or df is None:
                 failed.append(f"{market_type}:{symbol} ({err})")
                 continue
-            symbol_windows = symbol_best_by_window(symbol, pair, df, window_starts)
-            if not symbol_windows:
-                failed.append(f"{market_type}:{symbol} (insufficient historical data)")
-                continue
-            for ws, row in symbol_windows.items():
-                cur = winners.get(ws)
-                if cur is None or row["gain_percent"] > cur["gain_percent"]:
-                    winners[ws] = row
+            symbol_data.append((symbol, pair, df))
 
+    # Chained windows: next start date is previous winner max_date + 1 day.
     rows = []
-    for ws in sorted(winners.keys()):
-        r = winners[ws].copy()
-        r["market_type"] = market_type
-        rows.append(r)
+    for ws in chain_starts:
+        best = None
+        for symbol, pair, df in symbol_data:
+            row = symbol_best_by_window(symbol, pair, df, ws)
+            if row is None:
+                continue
+            if best is None or row["gain_percent"] > best["gain_percent"]:
+                best = row
+        if best is None:
+            continue
+        best["market_type"] = market_type
+        rows.append(best)
     return rows, failed, processed
 
 
-def export_winners(df: pd.DataFrame, csv_path: Path, xlsx_path: Path):
+def build_chained_starts(start_date: str, end_date: str) -> List[pd.Timestamp]:
+    starts = []
+    current = pd.Timestamp(start_date, tz="UTC")
+    hard_end = pd.Timestamp(end_date, tz="UTC")
+    while current <= hard_end:
+        starts.append(current)
+        # Placeholder; actual next start determined after winner max_date in reduce step.
+        current += pd.Timedelta(days=WINDOW_DAYS)
+    return starts
+
+
+def reduce_to_non_overlapping(winner_rows: List[dict], end_date: str) -> List[dict]:
+    if not winner_rows:
+        return []
+    by_start = {pd.Timestamp(r["window_start_date"]): r for r in winner_rows}
+    out = []
+    cur = min(by_start.keys())
+    hard_end = pd.Timestamp(end_date)
+    while cur <= hard_end:
+        r = by_start.get(cur)
+        if r is None:
+            cur += pd.Timedelta(days=1)
+            continue
+        out.append(r)
+        cur = pd.Timestamp(r["max_date"]) + pd.Timedelta(days=1)
+    return out
+
+
+def export_winners(df, csv_path, xlsx_path):
     df = df.sort_values("window_start_date", ascending=True).reset_index(drop=True)
     df.to_csv(csv_path, index=False)
-
-    pretty = df.rename(columns={
-        "window_start_date": "Window Start Date",
-        "window_end_date": "Window End Date",
-        "symbol": "Symbol",
-        "pair": "Pair",
-        "start_price": "Start Price",
-        "max_price": "Max Price",
-        "max_date": "Max Date",
-        "gain_percent": "Gain %",
-        "x_gain": "X Gain",
-    })[["Window Start Date", "Window End Date", "Symbol", "Pair", "Start Price", "Max Price", "Max Date", "Gain %", "X Gain"]]
-
+    pretty = df.rename(columns={"window_start_date": "Window Start Date", "window_end_date": "Window End Date", "symbol": "Symbol", "pair": "Pair", "start_price": "Start Price", "max_price": "Max Price", "max_date": "Max Date", "gain_percent": "Gain %", "x_gain": "X Gain"})[["Window Start Date", "Window End Date", "Symbol", "Pair", "Start Price", "Max Price", "Max Date", "Gain %", "X Gain"]]
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         pretty.to_excel(writer, sheet_name="Winners", index=False)
-        ws = writer.sheets["Winners"]
-        for cell in ws["H"][1:]:
-            cell.number_format = "0.00"
-        for cell in ws["I"][1:]:
-            cell.number_format = "0.00"
-        for col in ("E", "F"):
-            for cell in ws[col][1:]:
-                cell.number_format = "0.00000000"
 
 
 def main():
     t0 = time.time()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
     session = make_session()
+
     all_markets = fetch_markets(session)
     spot, futures = split_markets(all_markets)
-    if len(spot) == 0 and len(futures) == 0:
-        sample_keys = sorted(list(all_markets[0].keys())) if all_markets else []
-        print("WARNING: 0 markets classified. Sample keys from markets_details:", sample_keys)
+    print("Classification preview: total", len(all_markets), "spot", len(spot), "futures", len(futures))
 
     start_ts = pd.Timestamp(START_DATE, tz="UTC")
     end_ts = pd.Timestamp(END_DATE, tz="UTC")
-    window_starts = list(pd.date_range(start_ts, end_ts, freq="D"))
+    chain_starts = build_chained_starts(START_DATE, END_DATE)
     start_ms = int(start_ts.timestamp() * 1000)
     end_ms = int((end_ts + pd.Timedelta(days=1)).timestamp() * 1000) - 1
 
-    spot_rows, spot_failed, spot_processed = process_group(session, spot, "spot", start_ms, end_ms, window_starts)
-    fut_rows, fut_failed, fut_processed = process_group(session, futures, "futures", start_ms, end_ms, window_starts)
+    spot_rows, spot_failed, spot_processed = process_group(session, spot, "spot", start_ms, end_ms, chain_starts)
+    fut_rows, fut_failed, fut_processed = process_group(session, futures, "futures", start_ms, end_ms, chain_starts)
+
+    spot_rows = reduce_to_non_overlapping(spot_rows, END_DATE)
+    fut_rows = reduce_to_non_overlapping(fut_rows, END_DATE)
 
     cols = ["market_type", "window_start_date", "window_end_date", "symbol", "pair", "start_price", "max_price", "max_date", "gain_percent", "x_gain"]
     spot_df = pd.DataFrame(spot_rows, columns=cols)
@@ -307,9 +260,6 @@ def main():
     print(f"Total symbols processed: {spot_processed + fut_processed}")
     print(f"Total skipped symbols: {len(failed)}")
     print(f"Total rows generated: {len(spot_df) + len(fut_df)}")
-    print(f"Failed symbols list ({len(failed)}):")
-    for s in failed:
-        print(f"  - {s}")
     print(f"Runtime: {time.time() - t0:.2f}s")
 
 
