@@ -31,3 +31,8 @@ Rows are sorted by `window_start_date` ascending.
 ## Known limitation
 
 Exact historical listing/delisting status for each past date may not be fully available from active market details. The script uses currently active CoinDCX markets and skips symbols without sufficient historical data.
+
+## Candle endpoint note
+
+`https://public.coindcx.com/market_data/candles` will return `400 Invalid Request` if query parameters are missing.
+The script always sends required params (`pair`, `interval`) and optional range params (`startTime`, `endTime`) as documented.

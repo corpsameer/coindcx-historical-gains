@@ -116,19 +116,41 @@ def cache_path(market_type: str, pair: str) -> Path:
     return CACHE_DIR / f"{market_type}_{pair.replace('/', '_')}.json"
 
 
-def parse_candles(raw: list) -> pd.DataFrame:
-    """Parse CoinDCX 1D candles into date/open/high frame."""
+def parse_candles(raw) -> pd.DataFrame:
+    """Parse CoinDCX candle response into date/open/high frame.
+
+    CoinDCX docs show objects with keys {time, open, high, low, close, volume}.
+    Some environments may still return list tuples. We support both shapes.
+    """
     rows = []
+    if isinstance(raw, dict):
+        # Defensive: sometimes APIs wrap payloads.
+        for key in ["data", "candles", "result"]:
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+
+    if not isinstance(raw, list):
+        return pd.DataFrame(columns=["date", "open", "high"])
+
     for c in raw:
-        if not isinstance(c, (list, tuple)) or len(c) < 3:
-            continue
         try:
-            d = pd.to_datetime(int(c[0]), unit="ms", utc=True).date()
-            o = float(c[1])
-            h = float(c[2])
+            if isinstance(c, dict):
+                ts = c.get("time")
+                o = c.get("open")
+                h = c.get("high")
+            elif isinstance(c, (list, tuple)) and len(c) >= 3:
+                ts, o, h = c[0], c[1], c[2]
+            else:
+                continue
+
+            d = pd.to_datetime(int(ts), unit="ms", utc=True).date()
+            o = float(o)
+            h = float(h)
         except (TypeError, ValueError):
             continue
         rows.append({"date": d, "open": o, "high": h})
+
     if not rows:
         return pd.DataFrame(columns=["date", "open", "high"])
     return pd.DataFrame(rows).sort_values("date").drop_duplicates("date", keep="last")
@@ -147,7 +169,7 @@ def fetch_symbol_df(session: requests.Session, market: dict, market_type: str, s
                 params={"pair": pair, "interval": "1d", "startTime": start_ms, "endTime": end_ms, "limit": 1000},
             ).json()
             cp.write_text(json.dumps(raw), encoding="utf-8")
-        if not isinstance(raw, list) or not raw:
+        if (isinstance(raw, list) and not raw) or raw is None:
             return symbol, pair, None, "empty candle data"
         df = parse_candles(raw)
         if df.empty:
