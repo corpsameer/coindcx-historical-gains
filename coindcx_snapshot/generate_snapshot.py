@@ -78,6 +78,16 @@ def cache_path(symbol: str, interval: str) -> Path:
     return CACHE_DIR / f"{safe}_{interval}.json"
 
 
+def is_valid_candle_list(payload) -> bool:
+    if not isinstance(payload, list) or len(payload) == 0:
+        return False
+    first = payload[0]
+    if not isinstance(first, dict):
+        return False
+    expected_keys = {"open", "high", "low", "close", "o", "h", "l", "c"}
+    return any(k in first for k in expected_keys)
+
+
 def load_cached_candles(symbol: str, interval: str) -> Optional[List]:
     path = cache_path(symbol, interval)
     if not path.exists():
@@ -86,7 +96,8 @@ def load_cached_candles(symbol: str, interval: str) -> Optional[List]:
     if age > CACHE_TTL_SECONDS:
         return None
     try:
-        return json.loads(path.read_text())
+        payload = json.loads(path.read_text())
+        return payload if is_valid_candle_list(payload) else None
     except Exception:
         return None
 
@@ -106,24 +117,26 @@ def normalize_candle_payload(payload) -> Optional[List[Dict]]:
     return None
 
 
-def fetch_candles(symbol: str, interval: str, limit: int) -> Optional[List[Dict]]:
-    cached = load_cached_candles(symbol, interval)
-    if cached is not None:
-        return cached
+def fetch_candles(identifiers: List[str], interval: str, limit: int) -> Optional[List[Dict]]:
+    for identifier in identifiers:
+        cached = load_cached_candles(identifier, interval)
+        if cached is not None:
+            return cached
 
-    # CoinDCX has returned multiple request/response formats across endpoints.
-    candidates = [
-        {"pair": symbol, "interval": interval, "limit": limit},
-        {"symbol": symbol, "interval": interval, "limit": limit},
-    ]
-    for params in candidates:
-        response = request_with_retry(CANDLES_URL, params=params)
-        if response is None:
-            continue
-        payload = normalize_candle_payload(response.json())
-        if payload:
-            save_cached_candles(symbol, interval, payload)
-            return payload
+    # Try multiple query shapes against multiple market identifiers.
+    for identifier in identifiers:
+        candidates = [
+            {"pair": identifier, "interval": interval, "limit": limit},
+            {"symbol": identifier, "interval": interval, "limit": limit},
+        ]
+        for params in candidates:
+            response = request_with_retry(CANDLES_URL, params=params)
+            if response is None:
+                continue
+            payload = normalize_candle_payload(response.json())
+            if is_valid_candle_list(payload):
+                save_cached_candles(identifier, interval, payload)
+                return payload
     return None
 
 
@@ -220,20 +233,24 @@ def classify_momentum(change_7d, change_30d, rvol, breakout_1d) -> str:
 
 
 def build_symbol_snapshot(market: Dict, snapshot_time: str) -> Tuple[Optional[Dict], Optional[str]]:
-    symbol = str(market.get("coindcx_name") or market.get("symbol") or "")
+    coindcx_name = str(market.get("coindcx_name") or "")
+    symbol = str(market.get("symbol") or "")
+    pair = str(market.get("pair") or "")
+    identifiers = [x for x in [coindcx_name, pair, symbol] if x]
+    canonical_id = coindcx_name or pair or symbol
     market_type = classify_market(market)
-    if not symbol or market_type not in {"spot", "futures"}:
-        return None, symbol or "unknown"
+    if not canonical_id or market_type not in {"spot", "futures"}:
+        return None, canonical_id or "unknown"
 
-    candles_1d = fetch_candles(symbol, "1d", 90)
-    candles_4h = fetch_candles(symbol, "4h", 180)
+    candles_1d = fetch_candles(identifiers, "1d", 90)
+    candles_4h = fetch_candles(identifiers, "4h", 180)
     if not candles_1d or not candles_4h:
-        return None, symbol
+        return None, canonical_id
 
     df1 = to_df(candles_1d)
     df4 = to_df(candles_4h)
     if len(df1) < 2 or len(df4) < 2:
-        return None, symbol
+        return None, canonical_id
 
     c = df1["close"]
     v = df1["volume"].fillna(0)
@@ -301,7 +318,7 @@ def build_symbol_snapshot(market: Dict, snapshot_time: str) -> Tuple[Optional[Di
     snap = {
         "market_type": market_type,
         "symbol": str(market.get("symbol") or ""),
-        "pair": str(market.get("pair") or symbol),
+        "pair": str(market.get("pair") or canonical_id),
         "current_price": current_price,
         "snapshot_time_utc": snapshot_time,
         "change_1d_percent": safe_float(pct_change(c.iloc[-1], c.iloc[-2])) if len(c) >= 2 else None,
