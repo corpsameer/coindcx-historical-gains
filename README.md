@@ -1,6 +1,8 @@
-# CoinDCX Rolling 30-Day Gainers Report
+# CoinDCX Rolling 30-Day Window Winners Report
 
-Lightweight Python-only reporting script to generate CoinDCX-specific rolling 30-day highest gainers for Spot and USDT Futures using CoinDCX APIs only.
+Python-only script that uses CoinDCX APIs to compute rolling 30-day winners:
+- exactly **one Spot winner per window**
+- exactly **one USDT Futures winner per window**
 
 ## Setup
 
@@ -14,17 +16,18 @@ pip install -r requirements.txt
 python generate_report.py
 ```
 
-## Output files
+## Outputs
 
-The script auto-creates `cache/` and `output/` and generates:
+Auto-creates `cache/` and `output/` and writes:
 
-- `output/spot_full.csv` — all rolling rows for spot markets
-- `output/futures_full.csv` — all rolling rows for USDT futures markets
-- `output/spot_top_gainers.xlsx` — top 500 spot rows by `gain_percent`
-- `output/futures_top_gainers.xlsx` — top 500 futures rows by `gain_percent`
+- `output/spot_window_winners.csv`
+- `output/futures_window_winners.csv`
+- `output/spot_window_winners.xlsx`
+- `output/futures_window_winners.xlsx`
+- `output/all_window_winners.xlsx` (sheets: `Spot`, `Futures`)
 
-Raw candle payloads are cached per market in `cache/` as JSON and reused on reruns.
+Rows are sorted by `window_start_date` ascending.
 
-## Notes / known limitation
+## Known limitation
 
-Exact historical listing/delisting status for each past date may not be fully available from active market details. The script therefore uses currently available active CoinDCX markets and gracefully skips symbols without sufficient historical data.
+Exact historical listing/delisting status for each past date may not be fully available from active market details. The script uses currently active CoinDCX markets and skips symbols without sufficient historical data.
